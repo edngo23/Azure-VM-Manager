@@ -1,0 +1,232 @@
+Project: Azure VMs Control — Simulation‑Only Replica (LLM‑Ready Description + Framework)
+
+Purpose & Scope
+- Build a replica of the Azure VMs Control app that preserves the same UI, flows, and API surface but operates with no real Azure resources.
+- All Azure operations are represented by the same function calls and return types; in this replica they perform no external calls and instead update a local simulation state and generate synthetic data.
+
+Parity Goals (what remains identical to the real app)
+- UI/UX: Streamlit single‑page app, per‑VM Start/Deallocate button, power‑state badges, metrics charts (CPU %, Network In/Out), runtime display, auto‑shutdown warning + snooze, and confirmation dialogs.
+- API surface: Keep function signatures in azure_client.py (start/stop/deallocate, power state, instance view) and metrics.py (metrics queries, activity log runtime aggregation).
+- Configuration, preferences, and state persistence: VM inventory via env/JSON/YAML, UI prefs in configs/local/ui_prefs.yaml, runtime/snooze state in configs/local/runtime_state.yaml.
+
+Simulation Mode Design
+- Toggle: AZURE_SIM_MODE=1 (env var) or a CLI flag. When on, the app uses simulation adapters behind the same interfaces that the real app uses for Azure.
+- Adapters (drop‑in modules with identical signatures):
+  1) Compute Adapter (simulation)
+     - get_vm_power_state(subscription_id, resource_group, vm_name) -> str (PowerState/*)
+     - begin_start_vm(subscription_id, resource_group, vm_name)
+     - begin_deallocate_vm(subscription_id, resource_group, vm_name)
+     - get_vm_running_since(subscription_id, resource_group, vm_name) -> Optional[datetime]
+     Behavior: update a local VM state machine and record timestamps instead of calling Azure.
+  2) Monitor Adapter (simulation)
+     - query_vm_metrics(subscription_id, resource_group, vm_name, minutes|start_time,end_time)
+     - list_activity_events(subscription_id, resource_group, vm_name, start, end)
+     - total_runtime_in_window(subscription_id, resource_group, vm_name, start, end) -> int seconds
+     Behavior: produce synthetic time series and activity events consistent with the state machine.
+
+VM State Machine (local simulation)
+- States: Deallocated → Starting → Running → Deallocating → Deallocated
+- Transitions:
+  - begin_start_vm: set op flag “starting”; after a deterministic delay (e.g., 8–15s) commit to Running and set last_start_utc.
+  - begin_deallocate_vm: set op flag “deallocating”; after delay commit to Deallocated and set last_stop_utc.
+- Persistence: configs/local/sim_state.yaml stores per‑VM state, recent operations, and a per‑VM RNG seed for reproducibility.
+
+Synthetic Metrics Generation (monitor adapter)
+- Series: “Percentage CPU”, “Network In Total”, “Network Out Total”.
+- Pattern by window length (1m/5m/15m intervals chosen as in the real app):
+  - Idle baseline: CPU ~ N(2%, 0.8%), Net In/Out ~ N(150KB, 50KB).
+  - Start bursts: near each start event, CPU spikes to 40–80% for 1–3 minutes and decays exponentially; Net In/Out spikes to 2–20MB then decays.
+  - Clamp to non‑negative and CPU ≤ 100.
+- Current run window uses last_start_utc → now; rolling windows (1/7/30/90d) aggregate synthetic history.
+
+Synthetic Activity Logs & Runtime Aggregation
+- list_activity_events returns tuples (timestamp, operation_name.value) such as “…/start” and “…/deallocate” based on simulated transitions.
+- total_runtime_in_window pairs start/stop events, handles pre‑window starts and open segments to window end, and normalizes all timestamps to naive UTC.
+- 90‑day guard: clamp queries to end − 89d 23h 59m 59s to mirror Azure limits.
+
+Caching & Refresh Strategy (mirrors real app)
+- Live span metrics (current run): short TTL (e.g., 30s).
+- Rolling window charts: epoch‑keyed cache that refreshes only when the user changes the “Metrics Window” selection.
+- Aggregated runtime cache (60s) keyed by VM and start/end to reduce recomputation.
+- Autorefresh: 1s while VM operations or countdowns are active; 10–15s otherwise.
+
+Configuration (same schemas, no secrets)
+- VM inventory:
+  - Env: AZURE_VMS_JSON (single‑line JSON {"vms":[{name,resource_group,subscription_id}]}) or AZURE_VMS_YAML(_B64). Values are logical identifiers for the simulator.
+  - File: configs/local/azure_vms.yaml as a fallback.
+- UI preferences (configs/local/ui_prefs.yaml):
+  inactivity_monitor_enabled: false
+  monitor_window_minutes: 5
+  cpu_threshold: 5.0
+  net_threshold_mb: 10.0
+  metrics_window_choice: current
+- Simulation state (configs/local/sim_state.yaml):
+  vms:
+    <sub>/<rg>/<name>:
+      power_state: PowerState/deallocated|PowerState/starting|PowerState/running|PowerState/deallocating
+      last_start_utc: 2025-01-01T12:00:00Z
+      last_stop_utc: 2025-01-01T13:15:00Z
+      seed: 1234
+      history:
+        - type: start
+          at: 2025-01-01T12:00:00Z
+        - type: deallocate
+          at: 2025-01-01T13:15:00Z
+
+UI/UX Flows (unchanged semantics)
+- Manual Start/Deallocate with confirmation for deallocate; transitional badges and disabled buttons while ops run.
+- Auto‑shutdown checks synthetic metrics in the monitoring window; if inactive, shows 10s modal with Snooze (5m) or Shut down now. Snooze persists and suppresses re‑prompt.
+- Metrics Window (display only): Current run vs 1/7/30/90 days; charts and Runtime label follow the selection. Current run shows live ticking runtime; rolling windows sum historical run segments.
+
+Module Contracts (to keep API compatibility)
+- Compute (simulation adapter):
+  get_vm_power_state, begin_start_vm, begin_deallocate_vm, get_vm_running_since
+- Monitor (simulation adapter):
+  query_vm_metrics, list_activity_events, total_runtime_in_window
+- UI (unchanged): src/azure_ui/app.py orchestrates views, modals, and caching; it should not need to know whether the adapter is real or simulated.
+
+LLM Implementation Notes
+- Keep the same function names and return types so switching to real Azure later is a one‑line adapter swap.
+- Seed the random generator per VM using a stable hash of the VM name for repeatable charts.
+- Persist all simulated transitions so runtime aggregation and long‑window charts remain consistent across reruns.
+- Enforce the same constraints as Azure (1‑minute minimum spans, interval selection by window, 90‑day clamp) so UX parity holds.
+- Retain the app’s session_state structure: vm_ops, runtime_start_times, auto_shutdown_pending, auto_shutdown_snoozed_until, manual_shutdown_confirm, snooze_modal, metrics_window_choice, ui_* keys, pending_ui_sync, metrics_cache_epoch.
+
+Testing & Diagnostics
+- Deterministic mode: fixed delays and seeds; optional “time‑warp” to accelerate simulation.
+- Add a “Simulation diagnostics” panel listing VM power states, pending operations, snoozes, and last synthetic event times.
+- Include a “Config diagnostics” panel that reports the source of VM config (env vs file) and the number of VMs loaded.
+
+Migration Path to Real Azure
+- When real resources are available, turn off AZURE_SIM_MODE and use the Azure adapters; the UI remains unchanged.
+- Ensure credentials (Managed Identity or Service Principal) and RBAC roles are applied; remove simulation hooks if not needed.
+
+Summary
+- This replica reproduces the full UX of the Azure VMs Control app without contacting Azure. The adapters provide the same API, while the simulator supplies realistic‑looking metrics, power‑state transitions, and activity logs. An LLM can implement this baseline by stubbing the two adapter modules behind fixed interfaces and keeping the Streamlit UI intact.
+
+
+Implementation Blueprint (step‑by‑step)
+1) Detect simulation mode early
+   - Read `AZURE_SIM_MODE` ("1"/"true" → on). Provide a CLI fallback if needed.
+2) Wire adapters behind identical interfaces
+   - Option A: Inside `azure_client.py` and `metrics.py`, branch on `AZURE_SIM_MODE` and call either real or simulated implementations.
+   - Option B: Create `src/azure_ui/adapters/compute_sim.py` and `metrics_sim.py` and import them conditionally.
+3) Implement the Compute simulation
+   - Data store: `configs/local/sim_state.yaml` (create if missing).
+   - Functions:
+     - `get_vm_power_state(...)` → read sim_state (default `PowerState/deallocated`).
+     - `begin_start_vm(...)` → set `vm_ops[name]="starting"`; record `pending_start_at = now + delay`; on subsequent reruns when `now >= pending_start_at`, flip to `PowerState/running` and set `last_start_utc`.
+     - `begin_deallocate_vm(...)` → analogous with `pending_deallocate_at`, flip to `PowerState/deallocated`, set `last_stop_utc`.
+     - `get_vm_running_since(...)` → return `last_start_utc` from sim_state.
+4) Implement the Monitor simulation
+   - `query_vm_metrics(...)` → generate series per interval:
+     - Choose interval by span (<=6h → 1m; <=1d → 5m; else → 15m).
+     - For each bucket timestamp, sample CPU and Network using the formulas below; introduce peaks near last_start_utc and historical starts.
+   - `list_activity_events(...)` → emit `/start` and `/deallocate` for simulated transitions in range; return sorted by timestamp (naive UTC).
+   - `total_runtime_in_window(...)` → replicate pairing logic; handle starts before window and open segments at end.
+5) Keep UI untouched
+   - The Streamlit app continues to use the same functions. Simulation happens behind those functions.
+6) Persist and seed randomness
+   - For each VM key (`<sub>/<rg>/<name>`), store `seed` in sim_state.
+   - Use `random.Random(seed)` or `numpy.random.default_rng(seed)` for deterministic series.
+7) Testing
+   - Verify flows: start → running, auto‑shutdown prompt → snooze, deallocate → deallocated.
+   - Check that metrics window changes recache charts and that runtime aggregates across windows.
+
+Interface Reference (normative signatures)
+compute (azure_client.py)
+  def get_vm_power_state(subscription_id: str, resource_group: str, vm_name: str) -> str
+  def begin_start_vm(subscription_id: str, resource_group: str, vm_name: str)
+  def begin_deallocate_vm(subscription_id: str, resource_group: str, vm_name: str)
+  def get_vm_running_since(subscription_id: str, resource_group: str, vm_name: str) -> Optional[datetime]
+
+monitor (metrics.py)
+  def query_vm_metrics(subscription_id: str, resource_group: str, vm_name: str, minutes: Optional[int] = 15, start_time: Optional[datetime] = None, end_time: Optional[datetime] = None) -> Dict[str, List[Tuple[datetime, float]]]
+  def list_activity_events(subscription_id: str, resource_group: str, vm_name: str, start: datetime, end: datetime) -> List[Tuple[datetime, str]]
+  def total_runtime_in_window(subscription_id: str, resource_group: str, vm_name: str, start: datetime, end: datetime) -> int
+
+Synthetic Data Formulas (example)
+- Interval selection:
+  - span_minutes > 1440 → interval 15m
+  - span_minutes > 360 → interval 5m
+  - else → interval 1m
+- CPU % per bucket t:
+  - base = clamp(N(μ=2.0, σ=0.8), 0, 100)
+  - peak contribution: sum over each start S: A * exp(-(t-S)/τ) for t ≥ S, where A∈[40,80], τ∈[2,6] minutes (deterministic from seed)
+  - value = clamp(base + peak, 0, 100)
+- Network In/Out (bytes) per bucket t:
+  - base_in = clamp(N(μ=150_000, σ=50_000), ≥0)
+  - base_out similar
+  - peak_in/out: B * exp(-(t-S)/τ_net), B∈[2e6, 20e6], τ_net∈[2,8] minutes
+  - value = base + peak (per direction)
+- Historical starts:
+  - For long windows, synthesize start events every 24–48h with small jitter (±30m); include matching deallocate events to create distinct runs.
+
+Session State Keys (authoritative list)
+- vm_ops: { name: "starting"|"deallocating" }
+- runtime_start_times: { name: datetime_utc }
+- auto_shutdown_pending: { name: { deadline: datetime_utc, reason: "inactivity", vm: {sub,rg,name} } }
+- auto_shutdown_snoozed_until: { name: datetime_utc }
+- manual_shutdown_confirm: { name: True }
+- snooze_modal: { vm: name, until: iso } | None
+- ui_prefs_loaded: True
+- inactivity_monitor_enabled: bool
+- monitor_window_minutes: int
+- cpu_threshold: float
+- net_threshold_mb: float
+- metrics_window_choice: "current"|"1d"|"7d"|"30d"|"90d"
+- ui_inactivity_monitor_enabled, ui_monitor_window_minutes, ui_cpu_threshold, ui_net_threshold_mb, ui_metrics_window_choice
+- pending_ui_sync: dict (only keys that changed)
+- sidebar_notice: str | None
+- metrics_cache_epoch: int (increment when metrics window changes)
+
+Caching (exact expectations)
+- get_cached_vm_metrics(minutes): ttl=15s
+- get_cached_vm_metrics_runtime(start,end): ttl=30s
+- get_cached_last_start_time(lookback_hours): ttl=300s
+- get_cached_total_runtime_window(start,end): ttl=60s
+- get_cached_display_metrics(minutes, epoch): ttl=None; epoch invalidates cache only on window change
+
+File/Directory Layout (baseline)
+- src/azure_ui/app.py (UI)
+- src/azure_ui/azure_client.py (compute adapter; branch real/sim)
+- src/azure_ui/metrics.py (monitor adapter; branch real/sim)
+- src/azure_ui/config.py (load VM list from env/YAML/JSON; UI prefs)
+- src/azure_ui/state.py (persist start/snooze/runtime)
+- configs/local/azure_vms.yaml (optional local inventory)
+- configs/local/ui_prefs.yaml (sidebar defaults)
+- configs/local/runtime_state.yaml (runtime start/snooze)
+- configs/local/sim_state.yaml (simulation power state/events/seeds)
+
+Example Config Values
+- AZURE_VMS_JSON (single line): {"vms":[{"name":"vm-1","resource_group":"rg-1","subscription_id":"sub-1"}]}
+- ui_prefs.yaml:
+  inactivity_monitor_enabled: false
+  monitor_window_minutes: 5
+  cpu_threshold: 5.0
+  net_threshold_mb: 10.0
+  metrics_window_choice: current
+
+Typical UI Flow (replica)
+1) Page load: read VM list (env or file), initialize prefs/state, render per‑VM rows.
+2) Start click: show "Starting…"; after delay, transition to Running; runtime baseline set.
+3) Metrics Window change: bump cache epoch; rerun; charts + runtime switch to selected window.
+4) Auto‑shutdown eligibility: on inactivity → modal appears; user snoozes or confirms; countdown closes immediately on action.
+5) Deallocate confirm: transition to Deallocated; baseline cleared; metrics/runtimes update accordingly.
+
+Acceptance Criteria (replica completeness)
+- UI renders without contacting Azure; all actions work via simulation.
+- Per‑VM power state and runtime behave as described, including transitional badges.
+- Metrics charts and runtime reflect Current run and long windows consistently; 90‑day clamp applied.
+- Auto‑shutdown modal appears only when thresholds and datapoint count criteria are met; snooze persists across refreshes.
+- Cache behavior: rolling charts do not requery until window changes; apply/reset notices appear once per rerun; widgets reflect saved values.
+
+Error/Edge Handling
+- If VM list is missing/malformed: show warning and a diagnostic hint.
+- If simulation state is missing: initialize defaults for each VM.
+- Ensure all timestamps are naive UTC; convert tz‑aware values.
+- Enforce ≥1 minute spans for metrics queries; adapt interval by span.
+
+Migration Guidance (later real Azure)
+- Replace simulation adapters with real SDK calls; keep signatures and return types.
+- Ensure credentials and RBAC; remove `AZURE_SIM_MODE` or set it to 0.

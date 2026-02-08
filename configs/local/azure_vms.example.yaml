@@ -1,0 +1,11 @@
+# Example VM inventory configuration
+# Copy this to configs/local/azure_vms.yaml and customize for your VMs
+
+vms:
+  - name: demo-vm-1
+    resource_group: demo-rg
+    subscription_id: demo-sub-1
+  
+  - name: demo-vm-2
+    resource_group: demo-rg
+    subscription_id: demo-sub-1

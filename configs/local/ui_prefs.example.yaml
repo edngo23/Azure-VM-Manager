@@ -1,0 +1,8 @@
+# Example UI preferences configuration
+# Copy this to configs/local/ui_prefs.yaml to customize defaults
+
+inactivity_monitor_enabled: false
+monitor_window_minutes: 5
+cpu_threshold: 5.0
+net_threshold_mb: 10.0
+metrics_window_choice: current
