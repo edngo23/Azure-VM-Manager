@@ -260,26 +260,47 @@ def render_metrics(vm, metrics_client):
             net_out_data = metrics_data.get("Network Out Total", [])
             
             if cpu_data:
-                # CPU chart - convert to simple dict for Streamlit
+                # CPU chart - format timestamps concisely
                 cpu_dict = {
-                    "timestamp": [str(t) for t, _ in cpu_data],
+                    "Time": [_format_timestamp_concise(t) for t, _ in cpu_data],
                     "CPU %": [v for _, v in cpu_data]
                 }
                 cpu_df = pd.DataFrame(cpu_dict)
-                st.line_chart(data=cpu_df, x="timestamp", y="CPU %", use_container_width=True)
+                st.markdown("<h3 style='text-align: center'>CPU Utilization</h3>", unsafe_allow_html=True)
+                st.line_chart(data=cpu_df, x="Time", y="CPU %", use_container_width=True)
             
             if net_in_data:
-                # Network chart
+                # Network chart - convert bytes to MB and format timestamps
                 net_dict = {
-                    "timestamp": [str(t) for t, _ in net_in_data],
-                    "Network In (bytes)": [v for _, v in net_in_data],
-                    "Network Out (bytes)": [v for _, v in net_out_data] if net_out_data else [0] * len(net_in_data)
+                    "Time": [_format_timestamp_concise(t) for t, _ in net_in_data],
+                    "Network In (MB)": [v / (1024 * 1024) for _, v in net_in_data],
+                    "Network Out (MB)": [v / (1024 * 1024) for _, v in net_out_data] if net_out_data else [0] * len(net_in_data)
                 }
                 net_df = pd.DataFrame(net_dict)
-                st.line_chart(data=net_df, x="timestamp", y=["Network In (bytes)", "Network Out (bytes)"], use_container_width=True)
+                st.markdown("<h3 style='text-align: center'>Network I/O</h3>", unsafe_allow_html=True)
+                st.line_chart(data=net_df, x="Time", y=["Network In (MB)", "Network Out (MB)"], use_container_width=True)
     
     except Exception as e:
         st.error(f"Failed to load metrics: {str(e)}")
+
+
+def _format_timestamp_concise(dt: datetime) -> str:
+    """Format datetime concisely for chart readability.
+    
+    Uses HH:MM format if within last 24 hours, MM-DD HH:MM otherwise.
+    """
+    now = datetime.now(timezone.utc)
+    
+    # Ensure dt is timezone-aware
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    
+    # Check if within 24 hours
+    if (now - dt).total_seconds() < 86400:
+        return dt.strftime("%H:%M")
+    else:
+        return dt.strftime("%m-%d %H:%M")
+
 
 
 def render_statistics(vm, metrics_client, state_mgr):
