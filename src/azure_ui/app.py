@@ -102,8 +102,12 @@ def render_sidebar():
         
         # Simulation diagnostics
         st.subheader("Diagnostics")
-        if st.button("🔍 Show Simulation State"):
+        diagnostics_shown = st.session_state.get("show_diagnostics", False)
+        button_text = "🔍 Hide Simulation State" if diagnostics_shown else "🔍 Show Simulation State"
+        
+        if st.button(button_text):
             st.session_state["show_diagnostics"] = not st.session_state.get("show_diagnostics", False)
+            st.rerun()
         
         if st.session_state.get("show_diagnostics"):
             render_diagnostics()
