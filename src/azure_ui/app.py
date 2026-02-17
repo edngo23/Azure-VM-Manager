@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -56,6 +57,8 @@ def render_sidebar():
     """Render sidebar with controls and settings."""
     with st.sidebar:
         st.title("⚙️ Settings")
+        #TODO: add auto_refresh_interval to config instead of number here
+        st.markdown(f"Page auto-refreshes every {5} seconds...")
         
         # Metrics window selection
         st.subheader("Metrics Display")
@@ -158,14 +161,16 @@ def render_vm_card(vm, azure_client, metrics_client, state_mgr):
     if vm_key in st.session_state["vm_ops"] and not is_transitioning:
         del st.session_state["vm_ops"][vm_key]
     
-    # Track VMs with current runs for auto-refresh optimization
+    # Track VMs with current runs for auto-refresh optimization (use list, not set)
+    if "vms_with_current_runs" not in st.session_state:
+        st.session_state["vms_with_current_runs"] = []
+    
     if running_since and "running" in power_state.lower():
-        if "vms_with_current_runs" not in st.session_state:
-            st.session_state["vms_with_current_runs"] = set()
-        st.session_state["vms_with_current_runs"].add(vm_key)
+        if vm_key not in st.session_state["vms_with_current_runs"]:
+            st.session_state["vms_with_current_runs"].append(vm_key)
     else:
-        if "vms_with_current_runs" in st.session_state:
-            st.session_state["vms_with_current_runs"].discard(vm_key)
+        if vm_key in st.session_state["vms_with_current_runs"]:
+            st.session_state["vms_with_current_runs"].remove(vm_key)
     
     with st.container():
         # Header with VM name and status badge
@@ -239,6 +244,50 @@ def render_vm_card(vm, azure_client, metrics_client, state_mgr):
         
         # Statistics
         render_statistics(vm, metrics_client, state_mgr)
+
+
+def check_vm_inactivity(vm, metrics_client, monitor_window_minutes: int, cpu_threshold: float, net_threshold_mb: float) -> bool:
+    """
+    Check if a VM is inactive based on metrics thresholds.
+    
+    Returns True if both CPU and network usage are below thresholds for the entire monitor window.
+    """
+    try:
+        metrics_data = metrics_client.query_vm_metrics(
+            vm.subscription_id,
+            vm.resource_group,
+            vm.name,
+            minutes=monitor_window_minutes
+        )
+        
+        if not metrics_data:
+            return False
+        
+        # Check CPU usage
+        cpu_data = metrics_data.get("Percentage CPU", [])
+        if cpu_data:
+            avg_cpu = sum(v for _, v in cpu_data) / len(cpu_data)
+            if avg_cpu >= cpu_threshold:
+                return False  # VM is active (CPU above threshold)
+        
+        # Check network usage (convert bytes to MB)
+        net_in_data = metrics_data.get("Network In Total", [])
+        net_out_data = metrics_data.get("Network Out Total", [])
+        
+        if net_in_data and net_out_data:
+            total_in_mb = sum(v for _, v in net_in_data) / (1024 * 1024)
+            total_out_mb = sum(v for _, v in net_out_data) / (1024 * 1024)
+            total_net_mb = total_in_mb + total_out_mb
+            
+            if total_net_mb >= net_threshold_mb:
+                return False  # VM is active (network above threshold)
+        
+        # Both metrics are below thresholds - VM is inactive
+        return True
+    
+    except Exception as e:
+        # On error, assume VM is active (don't auto-shutdown)
+        return False
 
 
 def render_metrics(vm, metrics_client):
@@ -352,9 +401,53 @@ def render_shutdown_confirmation(vm_key: str, azure_client, state_mgr):
                     st.rerun()
 
 
+def render_inactivity_modal(vm_key: str, vm_name: str, azure_client, state_mgr):
+    """Render inactivity detection modal with snooze options."""
+    if st.session_state.get("inactivity_shutdown_pending", {}).get(vm_key):
+        with st.container():
+            st.warning(f"⚠️ {vm_name} is inactive. Auto-shutdown scheduled.")
+            st.info("Choose an action below:")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                if st.button("⏹️ Stop Now", key=f"inactivity_stop_now_{vm_key}"):
+                    cfg = get_config()
+                    vm = next((v for v in cfg.get_vms() if v.get_key() == vm_key), None)
+                    if vm:
+                        azure_client.begin_deallocate_vm(vm.subscription_id, vm.resource_group, vm.name)
+                    st.session_state["inactivity_shutdown_pending"][vm_key] = False
+                    state_mgr.set_snooze_until(vm_key, None)
+                    st.rerun()
+            
+            with col2:
+                if st.button("⏸️ Snooze 15m", key=f"inactivity_snooze_15_{vm_key}"):
+                    snooze_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+                    state_mgr.set_snooze_until(vm_key, snooze_until)
+                    st.session_state["inactivity_shutdown_pending"][vm_key] = False
+                    st.rerun()
+            
+            with col3:
+                if st.button("⏸️ Snooze 30m", key=f"inactivity_snooze_30_{vm_key}"):
+                    snooze_until = datetime.now(timezone.utc) + timedelta(minutes=30)
+                    state_mgr.set_snooze_until(vm_key, snooze_until)
+                    st.session_state["inactivity_shutdown_pending"][vm_key] = False
+                    st.rerun()
+            
+            with col4:
+                if st.button("⏸️ Snooze 1h", key=f"inactivity_snooze_60_{vm_key}"):
+                    snooze_until = datetime.now(timezone.utc) + timedelta(minutes=60)
+                    state_mgr.set_snooze_until(vm_key, snooze_until)
+                    st.session_state["inactivity_shutdown_pending"][vm_key] = False
+                    st.rerun()
+
+
 def main():
     """Main application entry point."""
     init_page()
+
+    #TODO: add to config instead of variable here
+    auto_refresh_interval = 5000  # milliseconds (5 seconds)
     
     # Load preferences on first run
     if not st.session_state.get("ui_prefs_loaded"):
@@ -382,8 +475,42 @@ def main():
     # Render VM cards
     st.markdown("### Virtual Machines")
     
+    # Check for inactivity and manage auto-shutdown
+    if st.session_state.get("inactivity_monitor_enabled"):
+        monitor_window = st.session_state.get("monitor_window_minutes", 5)
+        cpu_threshold = st.session_state.get("cpu_threshold", 5.0)
+        net_threshold = st.session_state.get("net_threshold_mb", 10.0)
+        
+        for vm in vms:
+            vm_key = vm.get_key()
+            power_state = azure_client.get_vm_power_state(vm.subscription_id, vm.resource_group, vm.name)
+            running_since = azure_client.get_vm_running_since(vm.subscription_id, vm.resource_group, vm.name)
+            
+            # Only check inactivity for running VMs
+            if "running" in power_state.lower() and running_since:
+                # Check if currently snoozed
+                snooze_until = state_mgr.get_snooze_until(vm_key)
+                is_snoozed = snooze_until and datetime.now(timezone.utc) < snooze_until
+                
+                if not is_snoozed:
+                    # Check for inactivity
+                    is_inactive = check_vm_inactivity(vm, metrics_client, monitor_window, cpu_threshold, net_threshold)
+                    
+                    if is_inactive:
+                        # Mark as pending auto-shutdown
+                        if "inactivity_shutdown_pending" not in st.session_state:
+                            st.session_state["inactivity_shutdown_pending"] = {}
+                        st.session_state["inactivity_shutdown_pending"][vm_key] = True
+                    else:
+                        # VM is active, clear any pending shutdown
+                        if "inactivity_shutdown_pending" in st.session_state:
+                            st.session_state["inactivity_shutdown_pending"].pop(vm_key, None)
+    
     for vm in vms:
         vm_key = vm.get_key()
+        
+        # Render inactivity modal if needed
+        render_inactivity_modal(vm_key, vm.name, azure_client, state_mgr)
         
         # Render shutdown confirmation if needed
         render_shutdown_confirmation(vm_key, azure_client, state_mgr)
@@ -399,9 +526,17 @@ def main():
     has_current_runs = bool(st.session_state.get("vms_with_current_runs"))
     
     if has_transitioning_vms or has_current_runs:
-        if has_transitioning_vms:
-            st.info("VMs are transitioning. Page will auto-refresh...")
-        st.rerun()
+        #TODO: make interval adjustable in config
+        auto_refresh_interval = 3000  # 3 seconds
+
+    # Show refresh status if needed
+    if has_transitioning_vms:
+        st.info(f"VMs are transitioning. Page auto-refreshes every {auto_refresh_interval // 1000} seconds...")
+    elif has_current_runs:
+        st.info(f"Monitoring running VMs. Page auto-refreshes every {auto_refresh_interval // 1000} seconds...")
+
+    st_autorefresh(interval=auto_refresh_interval, limit=None, key="vm_autorefresh_key")
+
 
 
 if __name__ == "__main__":

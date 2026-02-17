@@ -6,3 +6,4 @@ azure-mgmt-compute==30.6.0
 azure-monitor-query==1.4.0
 numpy==1.24.3
 pandas==2.0.3
+streamlit-autorefresh==1.0.1

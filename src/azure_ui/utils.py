@@ -147,6 +147,7 @@ class StateUtils:
             "auto_shutdown_pending": {},  # {vm_key: {"deadline": datetime, "reason": str}}
             "auto_shutdown_snoozed_until": {},  # {vm_key: datetime}
             "manual_shutdown_confirm": {},  # {vm_key: True}
+            "inactivity_shutdown_pending": {},  # {vm_key: True}
             "snooze_modal": None,  # {"vm": vm_key, "until": iso_str} | None
             "metrics_window_choice": "current",  # "current", "1d", "7d", "30d", "90d"
             "ui_prefs_loaded": False,
